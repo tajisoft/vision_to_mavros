@@ -83,6 +83,13 @@ scale_factor = 1.0
 # Enable using yaw from compass to align north (zero degree is facing north)
 compass_enabled = 0
 
+# Enable adjusting yaw of vehicle using T265 yaw angle gap
+yaw_gap_control_enabled = True
+yaw_gap_control_ch = '8'          # Aux CH8
+yaw_gap_control_threshold = 20.0  # In degree
+yaw_gap_control_relative = 0      # 0: Absolute 1:Relative
+yaw_gap_control_rate = 1          # deg/s
+
 # pose data confidence: 0x0 - Failed / 0x1 - Low / 0x2 - Medium / 0x3 - High 
 pose_data_confidence_level = ('FAILED', 'Low', 'Medium', 'High')
 
@@ -109,6 +116,8 @@ prev_data = None
 H_aeroRef_aeroBody = None
 V_aeroRef_aeroBody = None
 heading_north_yaw = None
+heading_on_armed = None
+camera_yaw_armed = None
 current_confidence_level = None
 current_time_us = 0
 
@@ -264,6 +273,9 @@ def send_vision_position_estimate_message():
             vehicle.send_mavlink(msg)
             vehicle.flush()
 
+            # Pass yaw to yaw gap handler
+            handle_camera_yaw_gap(rpy_rad[2])
+
 # https://mavlink.io/en/messages/ardupilotmega.html#VISION_POSITION_DELTA
 def send_vision_position_delta_message():
     global is_vehicle_connected, current_time_us, current_confidence_level, H_aeroRef_aeroBody
@@ -404,6 +416,54 @@ def att_msg_callback(self, attr_name, value):
         heading_north_yaw = value.yaw
         print("INFO: Received ATTITUDE message with heading yaw", heading_north_yaw * 180 / m.pi, "degrees")
 
+# Listen to arm/disarm data to acquire heading or reseting when yaw gap control enabled
+def armed_attr_callback(self, attr_name, value):
+    global heading_on_armed, vehicle
+    if value and heading_on_armed is None: # Armed
+        heading_on_armed = vehicle.attitude.yaw
+        print("INFO: Heading offset {} deg".format(m.degrees(heading_on_armed)))
+    if not value: # Disarmed
+        heading_on_armed = None
+
+# Monitoring camera yaw gap and send CONDITION_YAW command
+def handle_camera_yaw_gap(current_yaw):
+    global camera_yaw_armed, yaw_gap_control_threshold, current_time_us, vehicle
+    if vehicle.armed and camera_yaw_armed is None:
+        camera_yaw_armed = current_yaw
+        print("INFO: Camera heading offset {} deg".format(m.degrees(camera_yaw_armed)))
+    if not vehicle.armed:
+        camera_yaw_armed = None
+
+    if camera_yaw_armed is None or current_yaw is None or vehicle.location.global_relative_frame.alt < 0.5 or vehicle.channels[yaw_gap_control_ch] < 1900:
+        return
+    
+    # Condition yaw
+    camera_yaw_gap = m.degrees(camera_yaw_armed) - m.degrees(current_yaw)
+    if abs(camera_yaw_gap) >= yaw_gap_control_threshold :
+        target_angle = heading_on_armed if yaw_gap_control_relative == 0 else abs(camera_yaw_gap)
+        target_angle = m.degrees(target_angle)
+        if yaw_gap_control_relative == 0 and target_angle < 0:
+            target_angle += 360
+        
+        if debug_enable == 1:
+            print("Camera offset {} heading {} gap {} target {}".format(camera_yaw_armed, heading_on_armed, camera_yaw_gap, target_angle))
+
+        msg = vehicle.message_factory.command_long_encode(
+            int(vehicle._master.source_system),
+            0,
+            mavutil.mavlink.MAV_CMD_CONDITION_YAW,
+            0,
+            target_angle,
+            yaw_gap_control_rate,
+            -1 if camera_yaw_armed < current_yaw else 1,
+            yaw_gap_control_relative,
+            0,
+            0,
+            0
+        )
+        vehicle.send_mavlink(msg)
+        vehicle.flush()
+
 def vehicle_connect():
     global vehicle, is_vehicle_connected
     
@@ -498,6 +558,9 @@ send_msg_to_gcs('Camera connected.')
 if compass_enabled == 1:
     # Listen to the attitude data in aeronautical frame
     vehicle.add_message_listener('ATTITUDE', att_msg_callback)
+
+if yaw_gap_control_enabled:
+    vehicle.add_attribute_listener('armed', armed_attr_callback)
 
 # Send MAVlink messages in the background at pre-determined frequencies
 sched = BackgroundScheduler()
