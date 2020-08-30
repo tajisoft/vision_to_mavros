@@ -85,12 +85,18 @@ compass_enabled = 0
 
 # Enable adjusting yaw of vehicle using T265 yaw angle gap
 yaw_gap_control_enabled = True
-yaw_gap_control_ch = '8'          # Aux CH8
-yaw_gap_control_threshold = 20.0  # In degree
-yaw_gap_control_relative = 0      # 0: Absolute 1:Relative
-yaw_gap_control_rate = 1          # deg/s
-yaw_gap_control_retry_limit = 3   # Retry count
+yaw_gap_control_ch = '9'            # Aux CH9
+yaw_gap_control_threshold = 20.0    # In degree
+yaw_gap_control_relative = 0        # 0: Absolute 1:Relative
+yaw_gap_control_rate = 1            # deg/s
+yaw_gap_control_retry_limit = 3     # Retry count
 yaw_gap_control_state = ('INITIALIZING', 'IDLING', 'GAP_DETECTED', 'AJUSTING', 'INVALID')
+yaw_gap_camera_jump_detected = False
+# Keep wall
+keepwall_enabled = True
+keepwall_threshold = 0.2            # m
+keepwall_control_angle = 3          # deg
+
 
 # pose data confidence: 0x0 - Failed / 0x1 - Low / 0x2 - Medium / 0x3 - High 
 pose_data_confidence_level = ('FAILED', 'Low', 'Medium', 'High')
@@ -151,6 +157,8 @@ parser.add_argument('--scale_calib_enable', default=False, action='store_true',
                     help="Scale calibration. Only run while NOT in flight")
 parser.add_argument('--camera_orientation', type=int,
                     help="Configuration for camera orientation. Currently supported: forward, usb port to the right - 0; downward, usb port to the right - 1, 2: forward tilted down 45deg")
+parser.add_argument('--compass_enabled', type=int,
+                    help="Enable compass")
 parser.add_argument('--debug_enable',type=int,
                     help="Enable debug messages on terminal")
 
@@ -163,6 +171,7 @@ vision_position_delta_msg_hz = args.vision_position_delta_msg_hz
 vision_speed_estimate_msg_hz = args.vision_speed_estimate_msg_hz
 scale_calib_enable = args.scale_calib_enable
 camera_orientation = args.camera_orientation
+compass_enabled = args.compass_enabled
 debug_enable = args.debug_enable
 
 # Using default values if no specified inputs
@@ -282,6 +291,9 @@ def send_vision_position_estimate_message():
             # Pass yaw to yaw gap handler
             if yaw_gap_control_enabled:
                 handle_camera_yaw_gap(rpy_rad[2])
+            # Keep wall distance
+            if keepwall_enabled:
+                handle_keep_wall(H_aeroRef_aeroBody[0][3])
 
 # https://mavlink.io/en/messages/ardupilotmega.html#VISION_POSITION_DELTA
 def send_vision_position_delta_message():
@@ -421,31 +433,76 @@ def att_msg_callback(self, attr_name, value):
         print("INFO: Received first ATTITUDE message with heading yaw", heading_north_yaw * 180 / m.pi, "degrees")
     else:
         heading_north_yaw = value.yaw
-        print("INFO: Received ATTITUDE message with heading yaw", heading_north_yaw * 180 / m.pi, "degrees")
+        # print("INFO: Received ATTITUDE message with heading yaw", heading_north_yaw * 180 / m.pi, "degrees")
 
 # Listen to arm/disarm data to acquire heading or reseting when yaw gap control enabled
 def armed_attr_callback(self, attr_name, value):
-    global heading_on_armed, vehicle
+    global heading_on_armed, camera_yaw_armed, vehicle, yaw_gap_camera_jump_detected
     if value and heading_on_armed is None: # Armed
         heading_on_armed = vehicle.attitude.yaw
         print("INFO: Heading offset {} deg".format(m.degrees(heading_on_armed)))
     if not value: # Disarmed
         heading_on_armed = None
+        camera_yaw_armed = None
+        yaw_gap_camera_jump_detected = False
 
 # Listen to VISO align
 def ch_callback(self, attr_name, value):
-    global camera_align_ch, heading_north_yaw, yaw_gap_control_current_state, yaw_gap_control_state, camera_yaw_armed, heading_on_armed
-    print(attr_name)
-    print(value)
-    if attr_name[camera_align_ch] >= 1900:
+    global yaw_gap_camera_jump_detected, camera_align_ch, heading_north_yaw, yaw_gap_control_current_state, yaw_gap_control_state, camera_yaw_armed, heading_on_armed, yaw_gap_control_ajust_count
+    if camera_align_ch is not None and int(value[camera_align_ch]) >= 1900:
         heading_on_armed = heading_north_yaw
         camera_yaw_armed = None
         yaw_gap_control_current_state = yaw_gap_control_state[0]
+        yaw_gap_control_ajust_count = 0
+        yaw_gap_camera_jump_detected = False
+
+
+# Handle keep wall
+def handle_keep_wall(pos_y):
+    global keepwall_control_angle, keepwall_threshold, vehicle
+
+    def to_quaternion(roll = 0.0, pitch = 0.0, yaw = 0.0):
+        # Convert degrees to quaternions
+        t0 = m.cos(m.radians(yaw * 0.5))
+        t1 = m.sin(m.radians(yaw * 0.5))
+        t2 = m.cos(m.radians(roll * 0.5))
+        t3 = m.sin(m.radians(roll * 0.5))
+        t4 = m.cos(m.radians(pitch * 0.5))
+        t5 = m.sin(m.radians(pitch * 0.5))
+
+        w = t0 * t2 * t4 + t1 * t3 * t5
+        x = t0 * t3 * t4 - t1 * t2 * t5
+        y = t0 * t2 * t5 + t1 * t3 * t4
+        z = t1 * t2 * t4 - t0 * t3 * t5
+
+        return [w, x, y, z]
+
+    print('pos_y {}'.format(pos_y))
+    # Too close/far
+    if abs(pos_y) >= keepwall_threshold:
+        # Fixed 5deg controlling
+        pitch_angle = keepwall_control_angle if pos_y > 0 else -(keepwall_control_angle)
+        msg = vehicle.message_factory.set_attitude_target_encode(
+            0, # time_boot_ms
+            int(vehicle._master.source_system),
+            0, # Target component
+            0b00000100,
+            to_quaternion(vehicle.attitude.roll, pitch_angle, vehicle.attitude.yaw),
+            0, # Body roll rate in radian
+            0, # Body pitch rate in radian
+            0, # Body yaw rate in radian/second
+            0.5  # Thrust
+        )
+        vehicle.send_mavlink(msg)
 
 
 # Monitoring camera yaw gap and send CONDITION_YAW command
 def handle_camera_yaw_gap(current_yaw):
-    global camera_yaw_armed, yaw_gap_control_threshold, yaw_gap_control_current_state, yaw_gap_control_last_ajust, yaw_gap_control_state, yaw_gap_control_ajust_count, yaw_gap_control_retry_limit, camera_align_ch, current_time_us, vehicle
+    global camera_yaw_armed, heading_on_armed, heading_north_yaw, yaw_gap_control_threshold, yaw_gap_control_current_state, yaw_gap_control_last_ajust, yaw_gap_control_state, yaw_gap_control_ajust_count, yaw_gap_control_retry_limit, camera_align_ch, current_time_us, vehicle
+
+    if vehicle.armed and camera_yaw_armed is None:
+        camera_yaw_armed = current_yaw
+        print("INFO: Camera heading offset {} deg".format(m.degrees(camera_yaw_armed)))
 
     # Enabled check
     if vehicle.channels[yaw_gap_control_ch] < 1900:
@@ -456,85 +513,108 @@ def handle_camera_yaw_gap(current_yaw):
         yaw_gap_control_current_state = yaw_gap_control_state[0]
     # Initializing
     elif yaw_gap_control_current_state == yaw_gap_control_state[0]:
-        yaw_gap_control_retry_limit = 0
+        yaw_gap_control_ajust_count = 0
         # Find camera align channel
-        for i in range(1, 10):
-            if vehicle.parameters['RC{}_OPTION'.format(i)] == 80:
-                camera_align_ch = i
-                break
-        if vehicle.armed and camera_yaw_armed is None:
-            camera_yaw_armed = current_yaw
-            print("INFO: Camera heading offset {} deg".format(m.degrees(camera_yaw_armed)))
-        if not vehicle.armed:
-            camera_yaw_armed = None
+        if camera_align_ch is None:
+            for i in range(1, 10):
+                if vehicle.parameters['RC{}_OPTION'.format(i)] == 80:
+                    camera_align_ch = i
+                    print('VISO Yaw alignment RC{}'.format(i))
+                    break
 
-        if camera_yaw_armed is not None and vehicle.location.global_relative_frame.alt >= 0.5:
+        if camera_yaw_armed is not None and heading_on_armed is not None and heading_north_yaw is not None and vehicle.location.global_relative_frame.alt >= 0.5:
             yaw_gap_control_current_state = yaw_gap_control_state[1]
     # Idling
     elif yaw_gap_control_current_state == yaw_gap_control_state[1]:
+        yaw_gap_control_ajust_count = 0
         compass_yaw_gap = m.degrees(heading_on_armed) - m.degrees(heading_north_yaw)
         if abs(compass_yaw_gap) >= yaw_gap_control_threshold:
             yaw_gap_control_current_state = yaw_gap_control_state[2]
-        camera_yaw_gap = m.degrees(camera_yaw_armed) - m.degrees(current_yaw)
-        if abs(camera_yaw_gap) >= yaw_gap_control_threshold:
-            yaw_gap_control_current_state = yaw_gap_control_state[2]
+        # Not use camera gap when jumpped
+        if not yaw_gap_camera_jump_detected:
+            camera_yaw_gap = m.degrees(camera_yaw_armed) - m.degrees(current_yaw)
+            if abs(camera_yaw_gap) >= yaw_gap_control_threshold:
+                yaw_gap_control_current_state = yaw_gap_control_state[2]
+        print('heading armed:{} cur:{} -gap->{} camera armed:{} cur:{} -gap->{}'.format(
+            heading_on_armed, heading_north_yaw, compass_yaw_gap, camera_yaw_armed, current_yaw, camera_yaw_gap
+        ))
     # Gap detected
     elif yaw_gap_control_current_state == yaw_gap_control_state[2]:
+        print('GAP!!')
         yaw_gap_control_current_state = yaw_gap_control_state[3]
     # Ajusting
     elif yaw_gap_control_current_state == yaw_gap_control_state[3]:
-        magCal = vehicle.parameters['EK3_MAG_CAL']
+        print('IN AJUSTING...')
+        magCal = 3
+        if 'EK3_MAG_CAL' in vehicle.parameters:
+            magCal = vehicle.parameters['EK3_MAG_CAL']
         # Use compass
         if magCal == 3:
             compass_yaw_gap = m.degrees(heading_on_armed) - m.degrees(heading_north_yaw)
+            print('current gap: {}'.format(compass_yaw_gap))
             if abs(compass_yaw_gap) < yaw_gap_control_threshold:
                 yaw_gap_control_current_state = yaw_gap_control_state[1]
         # External sensor
-        elif magCal == 5:
+        elif magCal == 5 and not yaw_gap_camera_jump_detected:
             camera_yaw_gap = m.degrees(camera_yaw_armed) - m.degrees(current_yaw)
             if abs(camera_yaw_gap) < yaw_gap_control_threshold:
                 yaw_gap_control_current_state = yaw_gap_control_state[1]
 
     
     # Condition yaw
-    if yaw_gap_control_current_state == yaw_gap_control_state[3] and current_time_us - yaw_gap_control_last_ajust > 5000000: # 500ms
-        target_angle = m.degrees(heading_on_armed) - m.degrees(heading_north_yaw)
-        if vehicle.parameters['EK3_MAG_CAL'] == 5:
-            target_angle = m.degrees(camera_yaw_armed) - m.degrees(current_yaw)
+    if yaw_gap_control_current_state == yaw_gap_control_state[3]:
+        compass_diff_angle = m.degrees(heading_on_armed) - m.degrees(heading_north_yaw)
+        # Default use compass
+        target_angle = compass_diff_angle
+        magCal = 3
+        if 'EK3_MAG_CAL' in vehicle.parameters:
+            magCal = vehicle.parameters['EK3_MAG_CAL']
+        if magCal == 5 and not yaw_gap_camera_jump_detected:
+            camera_diff_angle = m.degrees(camera_yaw_armed) - m.degrees(current_yaw)
+            if camera_diff_angle <= compass_diff_angle:
+                target_angle = camera_diff_angle
+
         if yaw_gap_control_relative == 1 and target_angle < 0:
             target_angle += 360
         
-        if debug_enable == 1:
-            print("Camera offset {} heading {} gap {}".format(camera_yaw_armed, heading_on_armed, target_angle))
+        print("Camera offset {} heading {} gap {}".format(camera_yaw_armed, heading_on_armed, target_angle))
 
-        msg = vehicle.message_factory.command_long_encode(
-            int(vehicle._master.source_system),
-            0,
-            mavutil.mavlink.MAV_CMD_CONDITION_YAW,
-            0,
-            target_angle,
-            yaw_gap_control_rate,
-            1 if target_angle < 0 else -1,
-            yaw_gap_control_relative,
-            0,
-            0,
-            0
-        )
-        vehicle.send_mavlink(msg)
-        vehicle.flush()
-        yaw_gap_control_ajust_count += 1
-        yaw_gap_control_last_ajust = current_time_us
+        if yaw_gap_control_last_ajust is None or current_time_us - yaw_gap_control_last_ajust > 5000000: # 500ms
+            msg = vehicle.message_factory.command_long_encode(
+                int(vehicle._master.source_system),
+                0,
+                mavutil.mavlink.MAV_CMD_CONDITION_YAW,
+                0,
+                target_angle,
+                yaw_gap_control_rate,
+                1 if target_angle < 0 else -1,
+                yaw_gap_control_relative,
+                0,
+                0,
+                0
+            )
+            vehicle.send_mavlink(msg)
+            vehicle.flush()
+            yaw_gap_control_ajust_count += 1
+            yaw_gap_control_last_ajust = current_time_us
+            print('Ajust requested: {} count:{}'.format(yaw_gap_control_last_ajust, yaw_gap_control_ajust_count))
     
-    # Check error
-    if yaw_gap_control_ajust_count > yaw_gap_control_retry_limit or current_time_us - yaw_gap_control_last_ajust > 10000000:
-        yaw_gap_control_current_state = yaw_gap_control_state[-1]
+        # Check error
+        if yaw_gap_control_ajust_count > yaw_gap_control_retry_limit or current_time_us - yaw_gap_control_last_ajust > 10000000:
+            print('eror {} {}'.format(
+                yaw_gap_control_ajust_count > yaw_gap_control_retry_limit,
+                current_time_us - yaw_gap_control_last_ajust > 10000000
+            ))
+            yaw_gap_control_current_state = yaw_gap_control_state[-1]
 
+    print(yaw_gap_control_current_state)
 
 def vehicle_connect():
     global vehicle, is_vehicle_connected
     
     try:
-        vehicle = connect(connection_string, wait_ready = True, baud = connection_baudrate, source_system = 1)
+        vehicle = connect(connection_string, wait_ready = False, baud = connection_baudrate, source_system = 1, timeout = 60)
+        vehicle.wait_ready(True)
     except:
         print('Connection error! Retrying...')
         sleep(1)
@@ -605,7 +685,8 @@ def user_input_monitor():
                 set_default_home_position()
             else:
                 print("Got keyboard input", c)
-        except IOError: pass
+        except:
+            pass
 
 
 #######################################
@@ -648,9 +729,9 @@ if enable_update_tracking_confidence_to_gcs:
     update_tracking_confidence_to_gcs.prev_confidence_level = -1
 
 # A separate thread to monitor user input
-user_keyboard_input_thread = threading.Thread(target=user_input_monitor)
-user_keyboard_input_thread.daemon = True
-user_keyboard_input_thread.start()
+#user_keyboard_input_thread = threading.Thread(target=user_input_monitor)
+#user_keyboard_input_thread.daemon = True
+#user_keyboard_input_thread.start()
 
 sched.start()
 
@@ -717,7 +798,7 @@ try:
                         print("Position jumped by: ", position_displacement)
                         increment_reset_counter()
                         # Set yaw gap control to invalid
-                        yaw_gap_control_current_state = yaw_gap_control_state[-1]
+                        yaw_gap_camera_jump_detected = True
                     
                 prev_data = data
 
