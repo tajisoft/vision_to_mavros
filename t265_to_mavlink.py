@@ -91,7 +91,7 @@ lock = threading.Lock()
 
 # Enable adjusting yaw of vehicle using T265 yaw angle gap
 yaw_gap_control_enabled = True
-yaw_gap_control_ch = '9'                # Aux CH9
+yaw_gap_control_ch = '8'                # Aux CH10
 yaw_gap_detect_type = 2                 # 0: Compass 1: Camera 2: Both
 yaw_gap_control_hz = 10.0               # 10Hz
 yaw_gap_control_threshold = 5.0         # In degree
@@ -99,11 +99,10 @@ yaw_gap_control_relative = 0            # 0: Absolute 1:Relative
 yaw_gap_control_retry_limit = 30        # Retry count
 yaw_gap_control_min_interval = 500000   # 500ms
 yaw_gap_control_state = ('INITIALIZING', 'IDLING', 'GAP_DETECTED', 'AJUSTING', 'INVALID')
-yaw_gap_camera_jump_detected = False
-yaw_gap_control_allow_keepwall = False  # Allow keep wall action
+yaw_gap_control_allow_keepwall = True   # Allow keep wall action
 yaw_gap_control_wait_camera_recovery_counter = 10
 # Keep wall
-keepwall_enabled = True
+keepwall_enabled = True                 # Disable while offset control disabled
 keepwall_threshold = 0.30               # m
 keepwall_init_stable_threshold = 0.10   # m
 keepwall_control_angle_max = 5          # deg
@@ -140,6 +139,7 @@ camera_align_ch = None
 yaw_gap_control_current_state = None
 yaw_gap_control_last_ajust = None
 yaw_gap_control_ajust_count = 0
+yaw_gap_camera_jump_detected = False
 keepwall_init_pos_y = None
 keepwall_measure_array = []
 keepwall_last_measure = None
@@ -486,6 +486,7 @@ def dst_callback(self, attr_name, value):
 # Handle keep wall
 def handle_keep_wall():
     global keepwall_control_angle_max, keepwall_threshold, keepwall_init_stable_threshold, vehicle, is_vehicle_connected, H_aeroRef_aeroBody, keepwall_init_check_duration, keepwall_init_pos_y, keepwall_last_measure, current_time_us, keepwall_measure_array, current_confidence_level, yaw_gap_control_allow_keepwall, keepwall_rangefinder_past_distance, keepwall_rangefinder_last_distance, keepwall_rangefinder_last_measure
+
     # Keep wall distance
     if not keepwall_enabled or not is_vehicle_connected or vehicle.location.global_relative_frame.alt < 0.5:
         return
@@ -545,6 +546,9 @@ def handle_keep_wall():
                                     # Ignore leaving wall
                                     # diff_north = keepwall_threshold
                                     return
+                                # Check switch
+                                if vehicle.channels[yaw_gap_control_ch] < 1900:
+                                    return
                                 # Send local ned position target
                                 msg = vehicle.message_factory.set_position_target_local_ned_encode(
                                     0,
@@ -558,7 +562,7 @@ def handle_keep_wall():
                                 # send command to vehicle
                                 vehicle.send_mavlink(msg)
                                 vehicle.flush()
-                                print('INFO: Keep wall control {} m to {}'.format(diff_north, 'front' if diff_north > 0 else 'back'))
+                                send_msg_to_gcs('INFO: Keep wall {} {}m'.format('forward' if diff_north > 0 else 'back', diff_north))
         except:
             pass
 
@@ -638,6 +642,7 @@ def handle_camera_yaw_gap():
                 print('INFO: Gap monitoring: {}'.format(current_compass_yaw_gap))
                 if abs(current_compass_yaw_gap) < yaw_gap_control_threshold:
                     yaw_gap_control_current_state = yaw_gap_control_state[1]
+            # Invalid because pose jumped
             elif yaw_gap_control_current_state == yaw_gap_control_state[4]:
                 # Wait camera recovery
                 if current_confidence_level == 100.0:
