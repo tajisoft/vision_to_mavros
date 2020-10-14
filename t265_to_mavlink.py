@@ -454,7 +454,7 @@ def armed_attr_callback(self, attr_name, value):
 
 # Listen to VISO align
 def ch_callback(self, attr_name, value):
-    global vehicle, yaw_gap_camera_jump_detected, camera_align_ch, heading_north_yaw, yaw_gap_control_current_state, yaw_gap_control_state, camera_yaw_armed, heading_on_armed, yaw_gap_control_ajust_count, keepwall_init_pos_y
+    global vehicle, yaw_gap_camera_jump_detected, camera_align_ch, heading_north_yaw, yaw_gap_control_current_state, yaw_gap_control_state, camera_yaw_armed, heading_on_armed, yaw_gap_control_ajust_count, keepwall_init_pos_y, keepwall_rangefinder_last_distance, keepwall_rangefinder_last_measure, keepwall_rangefinder_past_distance, keepwall_rangefinder_past_measure, keepwall_last_measure, keepwall_measure_array
     if camera_align_ch is not None and int(value[camera_align_ch]) >= 1900:
         heading_on_armed = vehicle.attitude.yaw
         camera_yaw_armed = None
@@ -463,6 +463,12 @@ def ch_callback(self, attr_name, value):
         yaw_gap_camera_jump_detected = False
         # Keep wall reset
         keepwall_init_pos_y = None
+        keepwall_measure_array.clear()
+        keepwall_last_measure = None
+        keepwall_rangefinder_last_distance = None
+        keepwall_rangefinder_last_measure = None
+        keepwall_rangefinder_past_distance = None
+        keepwall_rangefinder_past_measure = None
         print('Yaw control reset heading: {} camera: {}'.format(heading_on_armed, camera_yaw_armed))
 
 # Listen to DISTANCE_SENSOR
