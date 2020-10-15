@@ -147,6 +147,7 @@ keepwall_rangefinder_last_distance = None
 keepwall_rangefinder_past_distance = None
 keepwall_rangefinder_last_measure = None
 keepwall_rangefinder_past_measure = None
+keepwall_last_warn_ms = None
 
 # Increment everytime pose_jumping or relocalization happens
 # See here: https://github.com/IntelRealSense/librealsense/blob/master/doc/t265.md#are-there-any-t265-specific-options
@@ -473,7 +474,7 @@ def ch_callback(self, attr_name, value):
 
 # Listen to DISTANCE_SENSOR
 def dst_callback(self, attr_name, value):
-    global current_time_us, keepwall_rangefinder_last_distance, keepwall_rangefinder_last_measure, keepwall_rangefinder_past_distance, keepwall_rangefinder_past_measure
+    global current_time_us, keepwall_rangefinder_last_distance, keepwall_rangefinder_last_measure, keepwall_rangefinder_past_distance, keepwall_rangefinder_past_measure, keepwall_last_warn_ms
     
     if value.orientation != 0 or value.current_distance < value.min_distance or value.current_distance > value.max_distance:
         return
@@ -500,7 +501,7 @@ def handle_keep_wall():
     if not yaw_gap_control_allow_keepwall:
         return
     # Need confidence level high
-    if current_confidence_level < 100.0 or yaw_gap_camera_jump_detected:
+    if current_confidence_level is None or current_confidence_level < 100.0 or yaw_gap_camera_jump_detected:
         return
 
     with lock:
@@ -548,9 +549,10 @@ def handle_keep_wall():
                                 # Dangerous distance
                                 if diff_north > 0:
                                     diff_north = -abs_pos_y
-                                else:
+                                elif diff_north < 0:
                                     # Ignore leaving wall
-                                    # diff_north = keepwall_threshold
+                                    diff_north = abs_pos_y
+                                else:
                                     return
                                 # Check switch
                                 if vehicle.channels[yaw_gap_control_ch] < 1900:
@@ -568,7 +570,10 @@ def handle_keep_wall():
                                 # send command to vehicle
                                 vehicle.send_mavlink(msg)
                                 vehicle.flush()
-                                send_msg_to_gcs('INFO: Keep wall {} {}m'.format('forward' if diff_north > 0 else 'back', diff_north))
+                                if keepwall_last_warn_ms is None or (time.time() - keepwall_last_warn_ms > 1000):
+                                    send_msg_to_gcs('INFO: Keep wall {} {}m'.format('forward' if diff_north > 0 else 'back', diff_north))
+                                    print('INFO: Keep wall {} {}m'.format('forward' if diff_north > 0 else 'back', diff_north))
+                                    keepwall_last_warn_ms = time.time()
         except:
             pass
 
